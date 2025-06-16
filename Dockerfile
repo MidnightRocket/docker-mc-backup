@@ -58,6 +58,7 @@ RUN apk -U --no-cache add \
     tar \
     tzdata \
     rsync \
+    btrfs-progs \
     zstd
 
 

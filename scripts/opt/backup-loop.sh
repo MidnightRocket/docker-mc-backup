@@ -235,6 +235,8 @@ load_rcon_password() {
 #   Passed a path to a log file that the backup tool's stdout and stderr should be written to.
 # prune() -> prune old backups. PRUNE_BACKUPS_DAYS is guaranteed to be positive.
 
+SCRIPT_DIR="$(realpath -- "$(dirname -- "$0")")"; readonly SCRIPT_DIR;
+. "$SCRIPT_DIR/backup-w-btrfs.sh"
 
 # shellcheck disable=SC2317
 tar() {
