@@ -19,7 +19,7 @@ Provides a side-car container to back up [itzg/minecraft-server](https://github.
 - `PAUSE_IF_NO_PLAYERS`=false
 - `PLAYERS_ONLINE_CHECK_INTERVAL`=5m
 - `PRUNE_BACKUPS_DAYS`=7
-- `PRUNE_BACKUPS_COUNT`= -disabled unless set (only works with tar/rsync)
+- `PRUNE_BACKUPS_COUNT`= -disabled unless set (only works with tar/rsync/btrfs)
 - `PRUNE_RESTIC_RETENTION`=--keep-within 7d
 - `RCON_HOST`=localhost
 - `RCON_PORT`=25575
@@ -60,6 +60,24 @@ If `PAUSE_IF_NO_PLAYERS`="true" and there are no players online after a backup i
 ### Backup methods
 
 Set `BACKUP_METHOD` to one of the following, where the default is `tar`.
+
+### `btrfs`
+The source folder needs to be a btrfs subvolume. 
+Currently the destination folder also needs to be a btrfs subvolume, although this technically not necessary it just needs to be a btrfs filesystem.
+
+#### Overview of available variables
+- `KEEP_MINIMUM_BACKUPS=1` Minimum amount of backups to keep. Useful in combination with `PRUNE_BACKUPS_DAYS`.
+- `LINK_LATEST=FALSE` Create a symlink which points at the latest snapshot. Set to `TRUE` to enable.
+
+The below variables are also used, and has the same meaning and defaults common variables described earlier.
+- `PRUNE_BACKUPS_COUNT`
+- `PRUNE_BACKUPS_DAYS`
+- `BACKUP_NAME`
+- `DEST_DIR`
+- `SRC_DIR`
+- `BACKUP_INTERVAL`
+- `PAUSE_IF_NO_PLAYERS`
+
 
 #### `tar`
 
