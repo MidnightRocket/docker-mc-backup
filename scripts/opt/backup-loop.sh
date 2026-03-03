@@ -23,8 +23,8 @@ fi
 : "${PAUSE_IF_NO_PLAYERS:=false}"
 : "${PLAYERS_ONLINE_CHECK_INTERVAL:=5m}"
 : "${BACKUP_METHOD:=tar}" # currently one of tar, restic, rsync
-: "${TAR_COMPRESS_METHOD:=gzip}"  # bzip2 gzip zstd
-: "${ZSTD_PARAMETERS:=-3 --long=25 --single-thread}"
+: "${TAR_COMPRESS_METHOD:=gzip}"  # bzip2 gzip lzip lzma lzop xz zstd
+: "${TAR_COMPRESS_PARAMETERS:=}"
 : "${PRUNE_BACKUPS_DAYS:=7}"
 : "${PRUNE_BACKUPS_COUNT:=}"
 : "${PRUNE_RESTIC_RETENTION:=--keep-within ${PRUNE_BACKUP_DAYS:-7}d}"
@@ -35,6 +35,8 @@ fi
 
 : "${RCON_RETRIES:=5}"
 : "${RCON_RETRY_INTERVAL:=10s}"
+: "${ENABLE_SAVE_ALL:=true}"
+: "${ENABLE_SYNC:=true}"
 : "${EXCLUDES=*.jar,cache,logs,*.tmp}" # Comma separated list of glob(3) patterns
 : "${EXCLUDES_FILE:=}" # Path to file containing list of glob(3) patterns
 : "${LINK_LATEST:=false}"
@@ -42,6 +44,8 @@ fi
 : "${RESTIC_HOSTNAME:=$(hostname)}"
 : "${RESTIC_VERBOSE:=false}"
 : "${RESTIC_LIMIT_UPLOAD:=0}"
+: "${RESTIC_CAT_CONFIG_TIMEOUT:=10s}"
+: "${RESTIC_RETRY_LOCK:=1m}" # Max time restic will retry to acquire a repository lock before failing
 : "${XDG_CONFIG_HOME:=/config}" # for rclone's base config path
 : "${ONE_SHOT:=false}"
 : "${TZ:=Etc/UTC}"
@@ -247,11 +251,14 @@ tar() {
   }
 
   _find_extra_backups() {
-  find "${DEST_DIR}" -maxdepth 1 -name "*.${backup_extension}" -exec ls -NtA {} \+ | \
-    tail -n +$((PRUNE_BACKUPS_COUNT + 1))
+  find "${DEST_DIR}" -maxdepth 1 -name "*.${backup_extension}" -exec ls -1Nt {} \+ | \
+    tail -n +$((PRUNE_BACKUPS_COUNT + 1)) | \
+    tr '\n' '\0'
   }
 
   init() {
+    : "${SKIP_LOCKING:=false}"
+
     mkdir -p "${DEST_DIR}"
 
     # NOTES
@@ -262,18 +269,38 @@ tar() {
     prune_backups_minutes=$(echo "scale=0; (${PRUNE_BACKUPS_DAYS} * 1440)/1"|bc)
 
     case "${TAR_COMPRESS_METHOD}" in
-        gzip)
-        readonly tar_parameters=("--gzip")
-        readonly backup_extension="tgz"
+        bzip2)
+        tar_compress_parameters=("bzip2")
+        readonly backup_extension="tar.bz2"
         ;;
 
-        bzip2)
-        readonly tar_parameters=("--bzip2")
-        readonly backup_extension="bz2"
+        gzip)
+        tar_compress_parameters=("gzip")
+        readonly backup_extension="tar.gz"
+        ;;
+
+        lzip)
+        tar_compress_parameters=("lzip")
+        readonly backup_extension="tar.lz"
+        ;;
+
+        lzma)
+        tar_compress_parameters=("lzma")
+        readonly backup_extension="tar.lzma"
+        ;;
+
+        lzop)
+        tar_compress_parameters=("lzop")
+        readonly backup_extension="tar.lzo"
+        ;;
+
+        xz)
+        tar_compress_parameters=("xz")
+        readonly backup_extension="tar.xz"
         ;;
 
         zstd)
-        readonly tar_parameters=("--use-compress-program" "zstd ${ZSTD_PARAMETERS}")
+        tar_compress_parameters=("zstd")
         readonly backup_extension="tar.zst"
         ;;
 
@@ -282,6 +309,9 @@ tar() {
         exit 1
         ;;
     esac
+
+    tar_compress_parameters+=("${TAR_COMPRESS_PARAMETERS[@]}")
+    readonly tar_compress_parameters
   }
   backup() {
     if [[ ! $1 ]]; then
@@ -293,7 +323,7 @@ tar() {
     outFile="${DEST_DIR}/${BACKUP_NAME}-${ts}.${backup_extension}"
     log INFO "Backing up content in ${SRC_DIR} to ${outFile}"
     exitCode=0
-    command tar "${excludes[@]}" "${tar_parameters[@]}" -cf "${outFile}" -C "${SRC_DIR}" "${includes_patterns[@]}" 2>&1 | tee "$1" || exitCode=$?
+    command tar "${excludes[@]}" -I "${tar_compress_parameters[*]}" -cf "${outFile}" -C "${SRC_DIR}" "${includes_patterns[@]}" 2>&1 | tee "$1" || exitCode=$?
     if [[ $exitCode -eq 1 ]]; then
       log WARN "Dat files changed as we read it"
     fi
@@ -313,7 +343,7 @@ tar() {
 
     if [ -n "${PRUNE_BACKUPS_COUNT}" ] && [ "${PRUNE_BACKUPS_COUNT}" -gt 0 ]; then
       log INFO "Pruning backup files to keep only the latest ${PRUNE_BACKUPS_COUNT} backups"
-      _find_extra_backups | xargs -r -n 1 rm -v | log INFO
+      _find_extra_backups | xargs -r -0 -n 1 rm -v | log INFO
     fi
   }
   call_if_function_exists "${@}"
@@ -332,6 +362,8 @@ rsync() {
   }
 
   init() {
+    : "${SKIP_LOCKING:=false}"
+
     mkdir -p "${DEST_DIR}"
   }
   backup() {
@@ -345,7 +377,7 @@ rsync() {
     if [ -d "${DEST_DIR}/latest" ]; then
       log INFO "Latest found so using it for link"
       link_dest=("--link-dest" "${DEST_DIR}/latest")
-    elif [ $(ls "${DEST_DIR}" | wc -l ) -lt 1 ]; then  
+    elif [ $(ls "${DEST_DIR}" | wc -l ) -lt 1 ]; then
       log INFO "No previous backups. Running full"
       link_dest=()
     else
@@ -397,23 +429,23 @@ restic() {
 
   _delete_old_backups() {
     # shellcheck disable=SC2086
-    command restic forget --tag "${restic_tags_filter}" ${PRUNE_RESTIC_RETENTION} "${@}"
+    command restic --retry-lock "${RESTIC_RETRY_LOCK}" forget --host "${RESTIC_HOSTNAME}" --tag "${restic_tags_filter}" ${PRUNE_RESTIC_RETENTION} "${@}"
   }
 
-  _unlock() {                                                                        
-  if ! [ -z "${output=$(command restic list locks 2>&1)}" ];then                     
-     log WARN "Confirmed stale lock on repo, unlocking..."                           
-     if [[ unlock=$(command restic unlock 2>&1) == *"success"* ]]; then              
-        log INFO "Successfully unlocked the repo"                                    
-     else                                                                            
-        log ERROR "Unable to unlock the repo. Is there another process running?"     
-        return 1                                                                          
-     fi                                                                                   
-  fi                                                                                      
+  _unlock() {
+  if ! [ -z "${output=$(command restic list locks 2>&1)}" ];then
+     log WARN "Confirmed stale lock on repo, unlocking..."
+     if [[ unlock=$(command restic unlock 2>&1) == *"success"* ]]; then
+        log INFO "Successfully unlocked the repo"
+     else
+        log ERROR "Unable to unlock the repo. Is there another process running?"
+        return 1
+     fi
+  fi
   }
 
   _check() {
-      if ! output="$(command restic check 2>&1)"; then
+      if ! output="$(command restic --retry-lock "${RESTIC_RETRY_LOCK}" check 2>&1)"; then
         log ERROR "Repository contains error! Aborting"
         <<<"${output}" log ERROR
         return 1
@@ -421,23 +453,30 @@ restic() {
   }
 
   init() {
+    : "${SKIP_LOCKING:=true}"
+
     if [ -z "${RESTIC_PASSWORD:-}" ] \
         && [ -z "${RESTIC_PASSWORD_FILE:-}" ] \
         && [ -z "${RESTIC_PASSWORD_COMMAND:-}" ]; then
       log ERROR "At least one of" RESTIC_PASSWORD{,_FILE,_COMMAND} "needs to be set!"
       return 1
     fi
-    if [ -z "${RESTIC_REPOSITORY:-}" ]; then
-      log ERROR "RESTIC_REPOSITORY is not set!"
+    if [ -z "${RESTIC_REPOSITORY:-}" ] && [ -z "${RESTIC_REPOSITORY_FILE:-}" ]; then
+      log ERROR "RESTIC_REPOSITORY or RESTIC_REPOSITORY_FILE is not set!"
       return 1
     fi
-    if output="$(command restic snapshots 2>&1 >/dev/null)"; then
+
+    if output="$(command timeout "${RESTIC_CAT_CONFIG_TIMEOUT}" restic cat config 2>&1 >/dev/null)"; then
       log INFO "Repository already initialized"
       log INFO "Checking for stale locks"
       _unlock
       log INFO "Checking repo integrity"
       _check
-    elif <<<"${output}" grep -q '^Is there a repository at the following location?$'; then
+    elif <<<"${output}" grep -q 'Fatal: unable to open config file: Stat: 400 Bad Request$'; then
+      <<<"${output}" log ERROR
+      log ERROR "Unable to open config file. Please check restic configuration"
+      return 1
+    elif <<<"${output}" grep -q 'Is there a repository at the following location?$'; then
       log INFO "Initializing new restic repository..."
       command restic init | log INFO
     elif <<<"${output}" grep -q 'wrong password'; then
@@ -446,10 +485,10 @@ restic() {
       return 1
     elif <<<"${output}" grep -q 'repository is already locked exclusively'; then
       <<<"${output}" log ERROR
-      log INFO "Detected stale lock, confirming..."                  
-      _unlock              
+      log INFO "Detected stale lock, confirming..."
+      _unlock
       log INFO "Checking repo integrity"
-      _check  
+      _check
     else
       <<<"${output}" log ERROR
       log INTERNALERROR "Unhandled restic repository state."
@@ -480,6 +519,7 @@ restic() {
 
     log INFO "Backing up content in ${SRC_DIR} as host ${RESTIC_HOSTNAME}"
     args=(
+      --retry-lock "${RESTIC_RETRY_LOCK}"
       --host "${RESTIC_HOSTNAME}"
       --limit-upload "${RESTIC_LIMIT_UPLOAD}"
     )
@@ -513,21 +553,43 @@ rclone() {
             'BEGIN { FS=";" } $1 < PRUNE_DATE { printf "%s/%s\n", DESTINATION, $2 }'
   }
   init() {
+    : "${SKIP_LOCKING:=false}"
+
     # Check if rclone is installed and configured correctly
     mkdir -p "${DEST_DIR}"
     case "${RCLONE_COMPRESS_METHOD}" in
-        gzip)
-        readonly tar_parameters=("--gzip")
-        readonly backup_extension="tgz"
+        bzip2)
+        tar_compress_parameters=("bzip2")
+        readonly backup_extension="tar.bz2"
         ;;
 
-        bzip2)
-        readonly tar_parameters=("--bzip2")
-        readonly backup_extension="bz2"
+        gzip)
+        tar_compress_parameters=("gzip")
+        readonly backup_extension="tar.gz"
+        ;;
+
+        lzip)
+        tar_compress_parameters=("lzip")
+        readonly backup_extension="tar.lz"
+        ;;
+
+        lzma)
+        tar_compress_parameters=("lzma")
+        readonly backup_extension="tar.lzma"
+        ;;
+
+        lzop)
+        tar_compress_parameters=("lzop")
+        readonly backup_extension="tar.lzo"
+        ;;
+
+        xz)
+        tar_compress_parameters=("xz")
+        readonly backup_extension="tar.xz"
         ;;
 
         zstd)
-        readonly tar_parameters=("--use-compress-program" "zstd ${ZSTD_PARAMETERS}")
+        tar_compress_parameters=("zstd")
         readonly backup_extension="tar.zst"
         ;;
 
@@ -536,6 +598,9 @@ rclone() {
         exit 1
         ;;
     esac
+
+    tar_compress_parameters+=("${TAR_COMPRESS_PARAMETERS[@]}")
+    readonly tar_compress_parameters
   }
   backup() {
     if [[ ! $1 ]]; then
@@ -546,7 +611,7 @@ rclone() {
     ts=$(date +"%Y%m%d-%H%M%S")
     outFile="${DEST_DIR}/${BACKUP_NAME}-${ts}.${backup_extension}"
     log INFO "Backing up content in ${SRC_DIR} to ${outFile}"
-    command tar "${excludes[@]}" "${tar_parameters[@]}" -cf "${outFile}" -C "${SRC_DIR}" "${includes_patterns[@]}" || exitCode=$?
+    command tar "${excludes[@]}" -I "${tar_compress_parameters[*]}" -cf "${outFile}" -C "${SRC_DIR}" "${includes_patterns[@]}" || exitCode=$?
     if [ ${exitCode:-0} -eq 0 ]; then
       true
     elif [ ${exitCode:-0} -eq 1 ]; then
@@ -570,6 +635,53 @@ rclone() {
     fi
   }
   call_if_function_exists "${@}"
+}
+
+do_backup() {
+  if [[ $PRE_SAVE_ALL_SCRIPT_FILE ]]; then
+    "$PRE_SAVE_ALL_SCRIPT_FILE"
+  fi
+
+  if retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-off; then
+    # No matter what we were doing, from now on if the script crashes
+    # or gets shut down, we want to make sure saving is on
+    trap 'retry 5 5s rcon-cli save-on' EXIT
+
+    if isTrue "$ENABLE_SAVE_ALL"; then
+      retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-all flush
+
+      if isTrue "$ENABLE_SYNC"; then
+        retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} sync
+      fi
+    fi
+
+    if [[ $PRE_BACKUP_SCRIPT_FILE ]]; then
+      "$PRE_BACKUP_SCRIPT_FILE"
+    fi
+
+    backup_status=0
+    "${BACKUP_METHOD}" backup "$backup_log" || backup_status=$?
+
+    if [[ $backup_status -ne 0 ]]; then
+      log ERROR "Backup failed with exit code $backup_status"
+    fi
+
+    if [[ $PRE_SAVE_ON_SCRIPT_FILE ]]; then
+      "$PRE_SAVE_ON_SCRIPT_FILE" $backup_status "$backup_log"
+    fi
+
+    retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-on
+
+    # Remove our exit trap now
+    trap EXIT
+
+    if [[ $POST_BACKUP_SCRIPT_FILE ]]; then
+      "$POST_BACKUP_SCRIPT_FILE" $backup_status "$backup_log"
+    fi
+  else
+    log ERROR "Unable to turn saving off. Is the server running?"
+    exit 1
+  fi
 }
 
 ##########
@@ -643,9 +755,13 @@ if ! is_one_shot; then
 fi
 
 first_run=TRUE
+backup_log="$(mktemp)"
+
+##########
+## loop ##
+##########
 
 while true; do
-  backup_log="$(mktemp)"
 
   if [[ $first_run == TRUE && ${ONE_SHOT^^} = FALSE && ${BACKUP_ON_STARTUP^^} = FALSE ]]; then
     log INFO "Skipping backup on startup"
@@ -657,45 +773,18 @@ while true; do
     log INFO "waiting for rcon readiness..."
     retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-on
 
-    if [[ $PRE_SAVE_ALL_SCRIPT_FILE ]]; then
-      "$PRE_SAVE_ALL_SCRIPT_FILE"
-    fi
-
-    if retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-off; then
-      # No matter what we were doing, from now on if the script crashes
-      # or gets shut down, we want to make sure saving is on
-      trap 'retry 5 5s rcon-cli save-on' EXIT
-
-      retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-all flush
-      retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} sync
-
-      if [[ $PRE_BACKUP_SCRIPT_FILE ]]; then
-        "$PRE_BACKUP_SCRIPT_FILE"
-      fi
-
-      backup_status=0
-      "${BACKUP_METHOD}" backup "$backup_log" || backup_status=$?
-
-      if [[ $backup_status -ne 0 ]]; then
-        log ERROR "Backup failed with exit code $backup_status"
-      fi
-
-      if [[ $PRE_SAVE_ON_SCRIPT_FILE ]]; then
-        "$PRE_SAVE_ON_SCRIPT_FILE" $backup_status "$backup_log"
-      fi
-
-      retry ${RCON_RETRIES} ${RCON_RETRY_INTERVAL} rcon-cli save-on
-
-      # Remove our exit trap now
-      trap EXIT
-
-      if [[ $POST_BACKUP_SCRIPT_FILE ]]; then
-        "$POST_BACKUP_SCRIPT_FILE" $backup_status "$backup_log"
-      fi
-
+    if isTrue "${SKIP_LOCKING}" || ! [[ -w "$DEST_DIR" ]]; then
+      do_backup
     else
-      log ERROR "Unable to turn saving off. Is the server running?"
-      exit 1
+
+      lockfile="$DEST_DIR/.mc-backup-lock"
+      # open lock file
+      exec 4<>"$lockfile"
+      flock 4
+      do_backup
+      # close lock file, which also releases lock
+      exec 4<&-
+
     fi
   else # paused
     log INFO "Server is paused, proceeding with backup"
@@ -718,7 +807,7 @@ while true; do
 
   rm "$backup_log"
 
-  if (( PRUNE_BACKUPS_DAYS > 0 )); then
+  if (( PRUNE_BACKUPS_DAYS > 0 )) || [[ -n "$PRUNE_BACKUPS_COUNT" ]]; then
     "${BACKUP_METHOD}" prune
   fi
 

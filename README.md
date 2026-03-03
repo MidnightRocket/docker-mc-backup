@@ -18,6 +18,8 @@ Provides a side-car container to back up [itzg/minecraft-server](https://github.
 - `BACKUP_ON_STARTUP`=true : Set to false to skip first backup on startup.
 - `PAUSE_IF_NO_PLAYERS`=false
 - `PLAYERS_ONLINE_CHECK_INTERVAL`=5m
+- `CRON_SCHEDULE`: disabled unless set, [see below](#cron-scheduling) how to enable
+- `CRON_BACKUP_UID`: Can be set to user id to run cron schedule as non-root.
 - `PRUNE_BACKUPS_DAYS`=7
 - `PRUNE_BACKUPS_COUNT`= -disabled unless set (only works with tar/rsync/btrfs)
 - `PRUNE_RESTIC_RETENTION`=--keep-within 7d
@@ -29,15 +31,14 @@ Provides a side-car container to back up [itzg/minecraft-server](https://github.
 - `RCON_RETRY_INTERVAL`=10s
 - `SERVER_HOST`=`RCON_HOST` : Can be set if the game and RCON are accessible on different addresses.
 - `SERVER_PORT`=25565
-- `INCLUDES`=. : comma separated list of include patterns relative to directory specified by `SRC_DIR` where `.` specifies all of that directory should be included in the backup. 
-
-  **For Restic** the default is the value of `SRC_DIR` to remain backward compatible with previous images.
+- `INCLUDES`=. : comma separated list of include patterns relative to directory specified by `SRC_DIR` where `.` specifies all of that directory should be included in the backup.
+- `ENABLE_SAVE_ALL`=true : Set to `false` to skip the `save-all` Minecraft server command before backup. This is useful if you experience issues with the server hanging on `save-all` command, **AND** it is ensured that the server regularly saves the world data to disk (i.e., autosave is enabled).
+- `ENABLE_SYNC`=true : Set to `false` to skip the `sync` Linux command that flushes the file system buffers to disk after the `save-all` Minecraft server command. Only disable this if you are experiencing issues (e.g., in cluster environments) and know what you are doing (see [issue #189](https://github.com/itzg/docker-mc-backup/issues/189)).
 - `EXCLUDES`=\*.jar,cache,logs,\*.tmp : commas separated list of file patterns to exclude from the backup. To disable exclusions, set to an empty string.
 - `EXCLUDES_FILE`: Can be set to read the list of excludes (one per line) from a file. Can be used with `EXCLUDES` to add more excludes.
-- `RESTIC_ADDITIONAL_TAGS`=mc_backups : additional tags to apply to the backup. Set to an empty string to disable additional tags.
-- `RESTIC_VERBOSE`=false : set to "true" to enable verbose output during restic backup operation
 - `TZ` : Can be set to the timezone to use for logging
 - `PRE_SAVE_ALL_SCRIPT`, `PRE_BACKUP_SCRIPT`, `PRE_SAVE_ON_SCRIPT`, `POST_BACKUP_SCRIPT`, `*_SCRIPT_FILE`: See [Backup scripts](#backup-scripts)
+- `SKIP_LOCKING` (true for restic, false for others): skips locking the `$DEST_DIR`, which prevents concurrent backup operations, such as scheduled and "now" executions
 
 If `PRUNE_BACKUPS_DAYS` is set to a positive number, it'll delete old `.tgz` backup files from `DEST_DIR`. By default deletes backups older than a week.
 
@@ -56,6 +57,37 @@ The `PAUSE_IF_NO_PLAYERS` option lets you pause backups if no players are online
 If `PAUSE_IF_NO_PLAYERS`="true" and there are no players online after a backup is made, then instead of immediately scheduling the next backup, the script will start checking the server's player count every `PLAYERS_ONLINE_CHECK_INTERVAL` (defaults to 5 minutes). Once a player joins the server, the next backup will be scheduled in `BACKUP_INTERVAL`.
 
 `EXCLUDES` is a comma-separated list of glob(3) patterns to exclude from backups. By default excludes all jar files (plugins, server files), logs folder and cache (used by i.e. PaperMC server).
+
+### Cron scheduling
+
+> [!WARNING]
+> The container must be run with root user to launch `crond`. While you can use `CRON_BACKUP_UID` parameter to use non-root user, this is still less secure than running the container as non-root user.
+
+Enable clock based scheduling with Cron by setting `CRON_SCHEDULE` to a value in the format of a [cron expression](https://en.wikipedia.org/wiki/Cron#Cron_expression).
+
+#### Examples
+- `CRON_SCHEDULE`="0 4 * * *" -> backup every day at 4 am
+- `CRON_SCHEDULE`="0 * * * *" -> backup every hour
+- `CRON_SCHEDULE`="0 0 1 * *" -> backup at the 1st day of every month
+
+The time is in UTC timezone by default, but if you want to use your servers local time, you can pass it to the container as seen in the `volumes` section below:
+
+```yaml
+backup:
+  image: itzg/mc-backup
+  restart: unless-stopped
+  environment:
+    CRON_SCHEDULE: "0 4 * * *"
+    CRON_BACKUP_UID: "1000"
+  volumes:
+    /etc/localtime:/etc/localtime:ro
+    /etc/timezone:/etc/timezone:ro
+```
+
+To run the backups as a non-root user, set `CRON_BACKUP_UID` to a user id and the backup processes will be spawned with that user. Service attribute `user` is incompatible with cron scheduling.
+
+> [!NOTE]
+> Setting `CRON_SCHEDULE` overrides other interval based backup triggering and thus these parameters have no effect while it's set: `INITIAL_DELAY`, `BACKUP INTERVAL`, `BACKUP_ON_STARTUP`, `PAUSE_IF_NO_PLAYERS` and `PLAYERS_ONLINE_CHECK_INTERVAL`
 
 ### Backup methods
 
@@ -84,13 +116,13 @@ The below variables are also used, and has the same meaning and defaults common 
 - `DEST_DIR`=/backups
 - `LINK_LATEST`=false
 - `TAR_COMPRESS_METHOD`=gzip
-- `ZSTD_PARAMETERS`=-3 --long=25 --single-thread
+- `TAR_COMPRESS_PARAMETERS`
 
 `LINK_LATEST` is a true/false flag that creates a symbolic link to the latest backup.
 
-`TAR_COMPRESS_METHOD` is the compression method used by tar. Valid value: gzip bzip2 zstd
+`TAR_COMPRESS_METHOD` is the compression method used by tar. Valid value: bzip2 gzip lzip lzma lzop xz zstd
 
-`ZSTD_PARAMETERS` sets the parameters for `zstd` compression. The `--long` parameter affects RAM requirements for both compression and decompression (the default of 25 means 2^25 bytes = 32 MB).
+`TAR_COMPRESS_PARAMETERS` sets the parameters for compression. Leaving this blank is fine.
 
 #### `rsync`
 
@@ -101,14 +133,19 @@ The below variables are also used, and has the same meaning and defaults common 
 
 #### `restic`
 
+- `RESTIC_ADDITIONAL_TAGS`=mc_backups : additional tags to apply to the backup. Set to an empty string to disable additional tags.
+- `RESTIC_VERBOSE`=false : set to "true" to enable verbose output during restic backup operation
+
 See [restic documentation](https://restic.readthedocs.io/en/latest/030_preparing_a_new_repo.html) on what variables are needed to be defined.
-At least one of `RESTIC_PASSWORD*` variables need to be defined, along with `RESTIC_REPOSITORY`.
+At least one of the `RESTIC_PASSWORD*` variables need to be defined, along with one of the `RESTIC_REPOSITORY*` variables.
 
 Use the `RESTIC_ADDITIONAL_TAGS` variable to define a space separated list of additional restic tags. The backup will always be tagged with the value of `BACKUP_NAME`. e.g.: `RESTIC_ADDITIONAL_TAGS=mc_backups foo bar` will tag your backup with `foo`, `bar`, `mc_backups` and the value of `BACKUP_NAME`.
 
 By default, the hostname, typically the container/pod's name, will be used as the Restic backup's hostname. That can be overridden by setting `RESTIC_HOSTNAME` 
 
 If you want to limit the restic backup upload speed, you can set the `RESTIC_LIMIT_UPLOAD` variable to a value in KiB/s. For example, `RESTIC_LIMIT_UPLOAD=1024` will limit the upload speed to approximately 1 MiB/s. By default, there is no limit.
+
+If multiple containers share the same repository, use `RESTIC_RETRY_LOCK` (e.g., 5m) to define how long Restic should retry acquiring the repository lock before giving up. This helps avoid conflicts during overlapping backup runs by allowing time for other jobs to finish and release the lock.
 
 You can fine tune the retention cycle of the restic backups using the `PRUNE_RESTIC_RETENTION` variable. Take a look at the [restic documentation](https://restic.readthedocs.io/en/latest/060_forget.html) for details.
 
@@ -136,7 +173,7 @@ There are a few special environment variables for the rclone method.
 - `DEST_DIR`=/backups is the container path where the archive is temporarily created
 - `RCLONE_DEST_DIR` is the directory on the remote
 
-Other parameters such as `PRUNE_BACKUPS_DAYS`, `ZSTD_PARAMETERS`, and `BACKUP_NAME` are all used as well.
+Other parameters such as `PRUNE_BACKUPS_DAYS`, `TAR_COMPRESS_PARAMETERS`, and `BACKUP_NAME` are all used as well.
 
 **Note** that you will need to place your rclone config file in `/config/rclone/rclone.conf`.
 This can be done by adding it through docker-compose,
@@ -205,7 +242,7 @@ docker run --rm ...data and backup -v args... itzg/mc-backup backup now
 The `PRE_SAVE_ALL_SCRIPT`, `PRE_BACKUP_SCRIPT`, `PRE_SAVE_ON_SCRIPT`, and `POST_BACKUP_SCRIPT`, variables may be set to a bash script to run before and after the backup process.
 Potential use-cases include sending notifications, or replicating a restic repository to a remote store.
 
-The backup waits for the server to respond to a rcon "save-on" command before running the scripts. After, the `PRE_SAVE_ALL_SCRIPT` is run, followed by rcon "save-off" and "save-all" commands. The, the `PRE_BACKUP_SCRIPT` is run, followed by the backup process. Then, the `PRE_SAVE_ON_SCRIPT` is run, followed by a rcon "save-on" command. Finally, the `POST_BACKUP_SCRIPT` is run.
+The backup waits for the server to respond to a rcon "save-on" command before running the scripts. After, the `PRE_SAVE_ALL_SCRIPT` is run, followed by rcon "save-off" and "save-all" commands. Then, the `PRE_BACKUP_SCRIPT` is run, followed by the backup process. Then, the `PRE_SAVE_ON_SCRIPT` is run, followed by a rcon "save-on" command. Finally, the `POST_BACKUP_SCRIPT` is run.
 
 `PRE_SAVE_ON_SCRIPT` and `POST_BACKUP_SCRIPT` are both passed the exit code of the backup as the first argument, and the path to a log of the backup tool's output as the second argument. This may be used to take different actions depending on whether or not the backup failed.
 
