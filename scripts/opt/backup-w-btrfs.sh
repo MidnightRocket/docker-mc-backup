@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 
 print() { printf "%b%b" "${1-""}" "${2-"\\n"}"; }
 stderr() { print "$@" 1>&2; }
@@ -57,7 +57,7 @@ btrfs() {
       exit 1
     fi
 
-    ts="$(date +"%Y-%m-%dT%H.%M.%S")"
+    ts="$(date +"%Y-%m-%dT%H%M%S")"
 
     baseName="@${BACKUP_NAME}-${ts}"
     outFile="${DEST_DIR}/$baseName"
